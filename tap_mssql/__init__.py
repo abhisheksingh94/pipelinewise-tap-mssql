@@ -201,9 +201,9 @@ def discover_catalog(mssql_conn, config):
     filter_dbs_config = config.get("filter_dbs")
 
     if filter_dbs_config:
-        filter_dbs_clause = ",".join(["'{}'".format(db) for db in filter_dbs_config.split(",")])
+        filter_dbs_clause = ",".join([f"'{db}'" for db in filter_dbs_config.split(",")])
 
-        table_schema_clause = "WHERE c.TABLE_SCHEMA IN ({})".format(filter_dbs_clause)
+        table_schema_clause = f"WHERE c.TABLE_SCHEMA IN ({filter_dbs_clause})"
     else:
         table_schema_clause = """
         WHERE c.TABLE_SCHEMA NOT IN (
@@ -217,14 +217,12 @@ def discover_catalog(mssql_conn, config):
         cur = open_conn.cursor()
         LOGGER.info("Fetching tables")
         cur.execute(
-            """SELECT TABLE_SCHEMA,
+            f"""SELECT TABLE_SCHEMA,
                 TABLE_NAME,
                 TABLE_TYPE
             FROM INFORMATION_SCHEMA.TABLES c
-            {}
-        """.format(
-                table_schema_clause
-            )
+            {table_schema_clause}
+        """
         )
         table_info = {}
 
@@ -235,51 +233,95 @@ def discover_catalog(mssql_conn, config):
             table_info[db][table] = {"row_count": None, "is_view": table_type == "VIEW"}
         LOGGER.info("Tables fetched, fetching columns")
         cur.execute(
-            """              with table_constraints as (
-                  select tc.TABLE_SCHEMA,
-                         tc.TABLE_NAME,
-                         tc.CONSTRAINT_NAME,
-                         tc.CONSTRAINT_TYPE,
-                         row_number() over (partition by tc.TABLE_SCHEMA, tc.TABLE_NAME
-                                                order by tc.constraint_TYPE) as row_number_rank
-                                
-                  from INFORMATION_SCHEMA.TABLE_CONSTRAINTS tc
-                  where tc.CONSTRAINT_TYPE in ('PRIMARY KEY', 'UNIQUE')
-               )
-               ,constraint_columns as (
-                select c.TABLE_SCHEMA
-                , c.TABLE_NAME
-                , c.COLUMN_NAME
-                , c.CONSTRAINT_NAME
-
-                from INFORMATION_SCHEMA.CONSTRAINT_COLUMN_USAGE c
-
-                join table_constraints tc
-                        on tc.TABLE_SCHEMA = c.TABLE_SCHEMA
+            f"""with table_constraints as (
+                select
+                    tc.TABLE_SCHEMA,
+                    tc.TABLE_NAME,
+                    tc.CONSTRAINT_NAME,
+                    tc.CONSTRAINT_TYPE,
+                    row_number() over (
+                        partition by tc.TABLE_SCHEMA,
+                        tc.TABLE_NAME
+                        order by
+                            tc.constraint_TYPE
+                    ) as row_number_rank
+                from
+                    INFORMATION_SCHEMA.TABLE_CONSTRAINTS tc
+                where
+                    tc.CONSTRAINT_TYPE in ('PRIMARY KEY', 'UNIQUE')
+                ),
+                constraint_columns as (
+                    select
+                        c.TABLE_SCHEMA,
+                        c.TABLE_NAME,
+                        c.COLUMN_NAME,
+                        c.CONSTRAINT_NAME
+                    from
+                        INFORMATION_SCHEMA.CONSTRAINT_COLUMN_USAGE c
+                        join table_constraints tc on tc.TABLE_SCHEMA = c.TABLE_SCHEMA
                         and tc.TABLE_NAME = c.TABLE_NAME
                         and tc.CONSTRAINT_NAME = c.CONSTRAINT_NAME
                         and tc.row_number_rank = 1
+                ),
+                vw_constraint as (
+                    SELECT
+                        vwpk.vw_name,
+                        tc.TABLE_NAME,
+                        tc.CONSTRAINT_NAME,
+                        kcu.COLUMN_NAME
+                    FROM
+                        INFORMATION_SCHEMA.TABLE_CONSTRAINTS AS tc
+                        INNER JOIN INFORMATION_SCHEMA.KEY_COLUMN_USAGE AS kcu ON tc.CONSTRAINT_NAME = kcu.CONSTRAINT_NAME
+                        INNER JOIN (
+                            SELECT
+                                DISTINCT OBJECT_NAME(dep.referenced_id) as vw_table_names,
+                                OBJECT_NAME(dep.referencing_id) as vw_name
+                            FROM
+                                sys.sql_expression_dependencies AS dep
+                            WHERE
+                                dep.referencing_id in (
+                                    select
+                                        OBJECT_ID(table_name)
+                                    from
+                                        INFORMATION_SCHEMA.VIEWS
+                                    where
+                                        TABLE_NAME like 'cdc_vw%'
+                                )
+                                and OBJECT_NAME(dep.referenced_id) = (
+                                    select
+                                        replace(
+                                            replace(OBJECT_NAME(dep.referencing_id), 'cdc_vw_', ''),
+                                            '_meltano',
+                                            ''
+                                        )
+                                )
+                        ) as vwpk on vwpk.vw_table_names = tc.TABLE_NAME
+                    WHERE
+                        tc.CONSTRAINT_TYPE = 'PRIMARY KEY'
                 )
-                SELECT c.TABLE_SCHEMA,
+                SELECT
+                    c.TABLE_SCHEMA,
                     c.TABLE_NAME,
                     c.COLUMN_NAME,
                     DATA_TYPE,
                     CHARACTER_MAXIMUM_LENGTH,
                     NUMERIC_PRECISION,
                     NUMERIC_SCALE,
-                    case when cc.COLUMN_NAME is null then 0 else 1 end
-                FROM INFORMATION_SCHEMA.COLUMNS c
-
-                left join constraint_columns cc
-                    on cc.TABLE_NAME = c.TABLE_NAME
+                    case
+                        when cc.COLUMN_NAME is null
+                        and vwcc.vw_name is null then 0
+                        else 1
+                    end
+                FROM
+                    INFORMATION_SCHEMA.COLUMNS c
+                    left join constraint_columns cc on cc.TABLE_NAME = c.TABLE_NAME
                     and cc.TABLE_SCHEMA = c.TABLE_SCHEMA
                     and cc.COLUMN_NAME = c.COLUMN_NAME
-
-                {}
-                ORDER BY c.TABLE_SCHEMA, c.TABLE_NAME, c.ORDINAL_POSITION
-        """.format(
-                table_schema_clause
-            )
+                    left join vw_constraint vwcc on vwcc.vw_name = c.TABLE_NAME
+                    and vwcc.COLUMN_NAME = c.COLUMN_NAME
+                    {table_schema_clause}
+                    ORDER BY c.TABLE_SCHEMA, c.TABLE_NAME, c.ORDINAL_POSITION
+        """
         )
         columns = []
         LOGGER.info(f"{ARRAYSIZE=}")
@@ -515,9 +557,7 @@ def get_non_cdc_streams(mssql_conn, catalog, config, state):
 
             if is_view:
                 raise Exception(
-                    "Unable to replicate stream({}) with cdc because it is a view.".format(
-                        stream.stream
-                    )
+                    f"Unable to replicate stream({stream.stream}) with cdc because it is a view."
                 )
 
             LOGGER.info("LOG_BASED stream %s will resume its historical sync", stream.tap_stream_id)
