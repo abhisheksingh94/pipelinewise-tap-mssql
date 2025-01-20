@@ -1,6 +1,5 @@
 #!/usr/bin/env python3
-# pylint: disable=duplicate-code,too-many-locals,simplifiable-if-expression
-
+# pylint: disable=duplicate-code,too-many-locals
 import copy
 
 import singer
@@ -19,13 +18,15 @@ def py_bin_to_mssql(binary_value):
 def verify_change_data_capture_table(connection, schema_name, table_name):
     cur = connection.cursor()
     cur.execute(
-        """select s.name as schema_name, t.name as table_name, t.is_tracked_by_cdc, t.object_id
-                   from sys.tables t
-                   join sys.schemas s on (s.schema_id = t.schema_id)
-                   and  t.name = '{}'
-                   and  s.name = '{}'""".format(
-            table_name.replace('"',''), schema_name.replace('"','')
-        )
+        f"""select s.name as schema_name, t.name as table_name, t.is_tracked_by_cdc, t.object_id
+        from sys.tables t
+        join sys.schemas s on (s.schema_id = t.schema_id)
+        and  t.name = replace(
+        replace('{table_name.replace('"','')}', 'cdc_vw_', ''),
+        '_meltano',
+        ''
+    )
+and  s.name = '{schema_name.replace('"','')}'"""
     )
     row = cur.fetchone()
 
@@ -78,12 +79,10 @@ def verify_read_isolation_databases(connection):
 
 def get_lsn_available_range(connection, capture_instance_name):
     cur = connection.cursor()
-    query = """SELECT sys.fn_cdc_get_min_lsn ( '{}' ) lsn_from
+    query = f"""SELECT sys.fn_cdc_get_min_lsn ( '{capture_instance_name}' ) lsn_from
                     , sys.fn_cdc_get_max_lsn () lsn_to
                ;
-            """.format(
-        capture_instance_name
-    )
+            """
     cur.execute(query)
     row = cur.fetchone()
 
@@ -207,9 +206,9 @@ def sync_historic_table(mssql_conn, config, catalog_entry, state, columns, strea
             if not verify_change_data_capture_table(mssql_conn, escaped_schema_name, escaped_table_name):
                 raise Exception(
                     (
-                        "Error {}.{}: does not have change data capture enabled. Call EXEC"
+                        f"Error {escaped_schema_name}.{escaped_table_name}: does not have change data capture enabled. Call EXEC"
                         " sys.sp_cdc_enable_table with relevant parameters to enable CDC."
-                    ).format(escaped_schema_name, escaped_table_name)
+                    )
                 )
 
             verify_read_isolation_databases(mssql_conn)
@@ -219,18 +218,16 @@ def sync_historic_table(mssql_conn, config, catalog_entry, state, columns, strea
             # Have captured the to_lsn before the initial load sync in-case records are added during the sync.
             lsn_to = str(get_to_lsn(mssql_conn)[0].hex())
 
-            select_sql = """
-                            SELECT {}
+            select_sql = f"""
+                            SELECT {",".join(escaped_columns)}
                                 ,'I' _sdc_operation_type
                                 , cast('1900-01-01' as datetime) _sdc_lsn_commit_timestamp
                                 , null _sdc_lsn_deleted_at
                                 , '00000000000000000000' _sdc_lsn_value
                                 , '00000000000000000000' _sdc_lsn_seq_value
                                 , 2 as _sdc_lsn_operation
-                            FROM {}.{}
-                            ;""".format(
-                ",".join(escaped_columns), escaped_schema_name, escaped_table_name
-            )
+                            FROM {escaped_schema_name}.{escaped_table_name}
+                            ;"""
             params = {}
 
             common.sync_query(
@@ -253,7 +250,6 @@ def sync_historic_table(mssql_conn, config, catalog_entry, state, columns, strea
     singer.clear_bookmark(state, catalog_entry.tap_stream_id, "last_pk_fetched")
 
     singer.write_message(activate_version_message)
-
 
 def sync_table(mssql_conn, config, catalog_entry, state, columns, stream_version):
     mssql_conn = MSSQLConnection(config)
@@ -298,20 +294,70 @@ def sync_table(mssql_conn, config, catalog_entry, state, columns, stream_version
             table_name = catalog_entry.table
             schema_name = common.get_database_name(catalog_entry)
             cdc_table = schema_name + "_" + table_name
-            escape_table_name = common.escape(catalog_entry.table)
             escaped_schema_name = common.escape(schema_name)
-            escaped_cdc_table = common.escape(cdc_table)
-            escaped_cdc_function = common.escape("fn_cdc_get_all_changes_" + cdc_table)
+
+            escape_table_name = common.escape(catalog_entry.table)
+            if 'cdc_vw' in cdc_table:
+                is_cdc_vw = True
+
+                cdc_vw_table = cdc_table
+                cdc_parent_table_name = cdc_vw_table.replace('cdc_vw_','').replace('_meltano','')
+                cdc_parent_table_clean = cdc_parent_table_name.replace('cdc_vw_', '').replace('_meltano','').replace(schema_name+'_','')
+
+                cur.execute(f"""WITH table_constraints AS (
+                                SELECT
+                                    tc.TABLE_SCHEMA,
+                                    tc.TABLE_NAME,
+                                    tc.CONSTRAINT_NAME
+                                FROM
+                                    INFORMATION_SCHEMA.TABLE_CONSTRAINTS tc
+                                WHERE
+                                    tc.CONSTRAINT_TYPE IN ('PRIMARY KEY', 'UNIQUE')
+                                    AND tc.TABLE_NAME = '{cdc_parent_table_clean}'
+                            )
+                            SELECT
+                                c.COLUMN_NAME
+                            FROM
+                                INFORMATION_SCHEMA.CONSTRAINT_COLUMN_USAGE c
+                                INNER JOIN table_constraints tc
+                                    ON c.TABLE_SCHEMA = tc.TABLE_SCHEMA
+                                    AND c.TABLE_NAME = tc.TABLE_NAME
+                                    AND c.CONSTRAINT_NAME = tc.CONSTRAINT_NAME;""")
+                
+                vw_pk_result = cur.fetchall()
+                vw_join_string=''
+                
+                for i, vw_key_col in enumerate(vw_pk_result):
+                    if len(vw_pk_result) == 1:  # If there's only one row
+                        vw_join_string += f' on cdc.{vw_key_col[0]}=mel.{vw_key_col[0]} '
+                    elif i < len(vw_pk_result) - 1:  # For all rows except the last
+                        vw_join_string += f' cdc.{vw_key_col[0]}=mel.{vw_key_col[0]} AND \n'
+                    else:  # For the last row
+                        vw_join_string += f' cdc.{vw_key_col[0]}=mel.{vw_key_col[0]} '
+
+                # Add the 'on' keyword only if vw_pk_result has more than 1 row
+                if len(vw_pk_result) > 1:
+                    vw_join_string = "on " + vw_join_string
+                
+                escaped_cdc_function = common.escape("fn_cdc_get_all_changes_" + cdc_parent_table_name)
+
+            else:
+                is_cdc_vw = False
+                escaped_cdc_function = common.escape("fn_cdc_get_all_changes_" + cdc_table)
+
 
             if not verify_change_data_capture_table(mssql_conn, escaped_schema_name, escape_table_name):
                 raise Exception(
                     (
-                        "Error {}.{}: does not have change data capture enabled. "
+                        f"Error {escaped_schema_name}.{escape_table_name}: does not have change data capture enabled. "
                         "Call EXEC sys.sp_cdc_enable_table with relevant parameters to enable CDC."
-                    ).format(escaped_schema_name, escape_table_name)
+                    )
                 )
 
-            lsn_range = get_lsn_available_range(mssql_conn, cdc_table)
+            if is_cdc_vw:
+                lsn_range = get_lsn_available_range(mssql_conn, cdc_parent_table_name)
+            else:
+                lsn_range = get_lsn_available_range(mssql_conn, cdc_table)
 
             if lsn_range[0] is not None:  # Test to see if there are any change records to process
                 lsn_from = str(lsn_range[0].hex())
@@ -327,6 +373,7 @@ def sync_table(mssql_conn, config, catalog_entry, state, columns, stream_version
                         lsn_from,
                         lsn_to,
                     )
+
                     if lsn_to == state_last_lsn:
                         LOGGER.info(
                             (
@@ -334,61 +381,85 @@ def sync_table(mssql_conn, config, catalog_entry, state, columns, stream_version
                                 " lsn available - no changes expected - state lsn will not be incremented"
                             ),
                         )
-                        from_lsn_expression = "{}".format(py_bin_to_mssql(state_last_lsn))
+                        from_lsn_expression = ''
+                        changes_expected = False
                     else:
+                        changes_expected = True
                         from_lsn_expression = (
                             (
-                                "sys.fn_cdc_increment_lsn({})"
-                            ).format(py_bin_to_mssql(state_last_lsn))
+                                f"sys.fn_cdc_increment_lsn({py_bin_to_mssql(state_last_lsn)})"
+                            )
                         )
                 else:
                     raise Exception(
                         (
-                            "Error {}.{}: CDC changes have expired, the minimum lsn is {}, the last"
-                            " processed lsn is {}. Recommend a full load as there may be missing data."
-                        ).format(escaped_schema_name, escape_table_name, lsn_from, state_last_lsn)
+                            f"Error {escaped_schema_name}.{escape_table_name}: CDC changes have expired, the minimum lsn is {lsn_from}, the last"
+                            f" processed lsn is {state_last_lsn}. Recommend a full load as there may be missing data."
+                        )
                     )
 
-                select_sql = """DECLARE @from_lsn binary (10), @to_lsn binary (10)
+                if changes_expected:
+                    if is_cdc_vw:
+                        select_sql = f"""DECLARE @from_lsn binary (10), @to_lsn binary (10)
 
-                                SET @from_lsn = {}
-                                SET @to_lsn = {}
+                                        SET @from_lsn = {from_lsn_expression}
+                                        SET @to_lsn = {py_bin_to_mssql(lsn_to)}
 
-                                SELECT {}
-                                    ,case __$operation
-                                        when 2 then 'I'
-                                        when 4 then 'U'
-                                        when 1 then 'D'
-                                    end _sdc_operation_type
-                                    , sys.fn_cdc_map_lsn_to_time(__$start_lsn) _sdc_lsn_commit_timestamp
-                                    , case __$operation
-                                        when 1 then sys.fn_cdc_map_lsn_to_time(__$start_lsn)
-                                        else null
-                                        end _sdc_lsn_deleted_at
-                                    , __$start_lsn _sdc_lsn_value
-                                    , __$seqval _sdc_lsn_seq_value
-                                    , __$operation _sdc_lsn_operation
-                                FROM cdc.{}(@from_lsn, @to_lsn, 'all')
-                                ORDER BY __$start_lsn, __$seqval, __$operation
-                                ;""".format(
-                    from_lsn_expression,
-                    py_bin_to_mssql(lsn_to),
-                    ",".join(escaped_columns),
-                    escaped_cdc_function,
-                )
+                                        SELECT {",".join([f"mel.{cols}" for cols in escaped_columns])}
+                                            ,case __$operation
+                                                when 2 then 'I'
+                                                when 4 then 'U'
+                                                when 1 then 'D'
+                                            end _sdc_operation_type
+                                            , sys.fn_cdc_map_lsn_to_time(__$start_lsn) _sdc_lsn_commit_timestamp
+                                            , case __$operation
+                                                when 1 then sys.fn_cdc_map_lsn_to_time(__$start_lsn)
+                                                else null
+                                                end _sdc_lsn_deleted_at
+                                            , __$start_lsn _sdc_lsn_value
+                                            , __$seqval _sdc_lsn_seq_value
+                                            , __$operation _sdc_lsn_operation
+                                        FROM cdc.{escaped_cdc_function}(@from_lsn, @to_lsn, 'all') as cdc
+                                        INNER JOIN {schema_name + "." + table_name} mel
+                                        {vw_join_string}
+                                        ORDER BY __$start_lsn, __$seqval, __$operation
+                                        ;"""
+                    else:
+                        select_sql = f"""DECLARE @from_lsn binary (10), @to_lsn binary (10)
 
-                params = {}
+                                        SET @from_lsn = {from_lsn_expression}
+                                        SET @to_lsn = {py_bin_to_mssql(lsn_to)}
 
-                common.sync_query(
-                    cur,
-                    catalog_entry,
-                    state,
-                    select_sql,
-                    extended_columns,
-                    stream_version,
-                    params,
-                    config,
-                )
+                                        SELECT {",".join(escaped_columns)}
+                                            ,case __$operation
+                                                when 2 then 'I'
+                                                when 4 then 'U'
+                                                when 1 then 'D'
+                                            end _sdc_operation_type
+                                            , sys.fn_cdc_map_lsn_to_time(__$start_lsn) _sdc_lsn_commit_timestamp
+                                            , case __$operation
+                                                when 1 then sys.fn_cdc_map_lsn_to_time(__$start_lsn)
+                                                else null
+                                                end _sdc_lsn_deleted_at
+                                            , __$start_lsn _sdc_lsn_value
+                                            , __$seqval _sdc_lsn_seq_value
+                                            , __$operation _sdc_lsn_operation
+                                        FROM cdc.{escaped_cdc_function}(@from_lsn, @to_lsn, 'all')
+                                        ORDER BY __$start_lsn, __$seqval, __$operation
+                                        ;"""
+
+                    params = {}
+
+                    common.sync_query(
+                        cur,
+                        catalog_entry,
+                        state,
+                        select_sql,
+                        extended_columns,
+                        stream_version,
+                        params,
+                        config,
+                    )
 
             else:
                 # Store the current database lsn number, need to store the latest lsn checkpoint because the
